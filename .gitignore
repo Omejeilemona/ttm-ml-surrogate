@@ -10,6 +10,8 @@ Thumbs.db
 
 # Generated outputs (regenerate by running the scripts)
 *.png
+# ...except the figures shown in README.md
+!figures/*.png
 # Ignore everything in data/ except the published data set. "data/*" (not
 # "data/") is needed: Git cannot re-include a file inside an ignored folder.
 data/*

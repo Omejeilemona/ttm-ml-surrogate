@@ -1,0 +1,14 @@
+# Conda environment for ttm-ml-surrogate.
+# Create with:   conda env create -f environment.yml
+# Activate with: conda activate ttm-ml
+# Versions are the ones the published results were produced with.
+name: ttm-ml
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy=2.4
+  - scipy=1.17
+  - matplotlib=3.11
+  - pandas=3.0
+  - scikit-learn=1.9
