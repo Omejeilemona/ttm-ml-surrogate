@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Generated outputs (regenerate by running the scripts)
+*.png
+data/
