@@ -29,8 +29,11 @@ Workflow
    - physics-informed model: linear regression on log10(Tl_peak - 300 K),
      i.e. a power law Tl_peak - 300 K = A * F_abs^a * tp^b; predictions
      are converted back with Tl = 300 + 10**z, so always above 300 K;
-   - extrapolation test: train linear, physics-informed and random forest
-     on F_abs < 1500 J/m^2 only, test on F_abs >= 1500 J/m^2.
+   - extrapolation test: train linear, physics-informed, random forest and
+     hybrid on F_abs < 1500 J/m^2 only, test on F_abs >= 1500 J/m^2.
+   Part 4, hybrid (residual learning): a random forest (settings by CV)
+   learns the residuals Tl_peak - power-law prediction; the hybrid
+   predicts power law + forest residual.
 5. One comparison table of all models; parity plots (parity_linear.png,
    parity_physics.png, parity_rf.png); extrapolation.png; feature
    importances; predictions for the two samples closest to the melting
@@ -49,6 +52,7 @@ from sklearn.model_selection import (train_test_split, GridSearchCV,
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.compose import TransformedTargetRegressor
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import (mean_absolute_error, r2_score, confusion_matrix,
@@ -165,6 +169,57 @@ def fit_physics_regression(X_train, X_test, y_train, y_test, cv):
                             model, cv_mae, X_train, X_test, y_train, y_test)
     row["exponents"] = (a, b)
     return row
+
+
+class HybridRegressor(RegressorMixin, BaseEstimator):
+    """
+    Residual learning: physics-informed power law + random forest correction.
+
+    fit:     1. fit the power law to (X, y);
+             2. residuals r = y - power-law prediction (what the physics misses);
+             3. fit a random forest to (X, r).
+    predict: power-law prediction + forest-predicted residual.
+
+    Written as one scikit-learn estimator so that GridSearchCV refits BOTH
+    stages on every training fold; fitting the power law once on all data
+    would leak the validation folds into the residuals.
+    """
+
+    def __init__(self, max_depth=None, min_samples_leaf=1,
+                 n_estimators=N_TREES, random_state=SEED):
+        # scikit-learn convention: __init__ only stores the settings
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.n_estimators = n_estimators
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        self.physics_ = make_physics_model().fit(X, y)
+        residual = y - self.physics_.predict(X)
+        self.forest_ = RandomForestRegressor(n_estimators=self.n_estimators,
+                                             max_depth=self.max_depth,
+                                             min_samples_leaf=self.min_samples_leaf,
+                                             random_state=self.random_state)
+        self.forest_.fit(X, residual)
+        return self
+
+    def predict(self, X):
+        return self.physics_.predict(X) + self.forest_.predict(X)
+
+
+def fit_hybrid_regression(X_train, X_test, y_train, y_test, cv):
+    # Same grid as the plain forest, but the forest now learns the residuals
+    search = GridSearchCV(HybridRegressor(), FOREST_GRID, cv=cv,
+                          scoring="neg_mean_absolute_error", n_jobs=-1)
+    search.fit(X_train, y_train)
+    p = search.best_params_
+    best = search.best_estimator_
+    residual = y_train - best.physics_.predict(X_train)
+    print(f"Hybrid: power-law residuals on training set: mean |r| {np.abs(residual).mean():.1f} K, "
+          f"range {residual.min():+.0f} to {residual.max():+.0f} K")
+    settings = f"max_depth={p['max_depth']}, min_samples_leaf={p['min_samples_leaf']}"
+    return regression_scores("Hybrid (power+RF)", settings, best, -search.best_score_,
+                             X_train, X_test, y_train, y_test)
 
 
 def parity_plot(row, y_train, y_test, path):
@@ -331,6 +386,8 @@ def extrapolation_test(df, X, y, path):
     A random forest predicts averages of training targets, so it can never
     predict a Tl_peak above the largest one it was trained on. The linear
     and physics-informed models are formulas and continue beyond the data.
+    The hybrid's forest also flattens, but only its correction to the
+    power law, not the temperature itself.
     """
     F = df["F_abs"].to_numpy()
     low, high = F < F_SPLIT, F >= F_SPLIT
@@ -343,10 +400,16 @@ def extrapolation_test(df, X, y, path):
                           FOREST_GRID, cv=cv, scoring="neg_mean_absolute_error", n_jobs=-1)
     search.fit(X_low, y_low)
     p = search.best_params_
+    hybrid = GridSearchCV(HybridRegressor(), FOREST_GRID, cv=cv,
+                          scoring="neg_mean_absolute_error", n_jobs=-1)
+    hybrid.fit(X_low, y_low)
+    ph = hybrid.best_params_
     models = [("Linear regression", LinearRegression().fit(X_low, y_low)),
               ("Physics-informed", make_physics_model().fit(X_low, y_low)),
               (f"Random forest (max_depth={p['max_depth']}, "
-               f"min_samples_leaf={p['min_samples_leaf']})", search.best_estimator_)]
+               f"min_samples_leaf={p['min_samples_leaf']})", search.best_estimator_),
+              (f"Hybrid (max_depth={ph['max_depth']}, "
+               f"min_samples_leaf={ph['min_samples_leaf']})", hybrid.best_estimator_)]
 
     print(f"\n=== Extrapolation test: train on F_abs < {F_SPLIT:.0f} J/m^2 "
           f"({low.sum()} runs, Tl_peak up to {y_low.max():.0f} K), "
@@ -356,7 +419,7 @@ def extrapolation_test(df, X, y, path):
           f"{'MAE, extrapolation':>18s} | {'Max predicted Tl':>16s} |")
     print("|" + "---|" * 4)
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.6), sharey=True)
+    fig, axes = plt.subplots(1, len(models), figsize=(4.3 * len(models), 4.6), sharey=True)
     for ax, (name, model) in zip(axes, models):
         pred_low, pred_high = model.predict(X_low), model.predict(X_high)
         mae_low = mean_absolute_error(y_low, pred_low)
@@ -409,7 +472,8 @@ if __name__ == "__main__":
     lin = fit_linear_regression(X_train, X_test, yr_train, yr_test, cv_reg)
     phys = fit_physics_regression(X_train, X_test, yr_train, yr_test, cv_reg)
     rf_reg = fit_forest_regressor(X_train, X_test, yr_train, yr_test, cv_reg)
-    print_regression_table([lin, phys, rf_reg])
+    hybrid = fit_hybrid_regression(X_train, X_test, yr_train, yr_test, cv_reg)
+    print_regression_table([lin, phys, rf_reg, hybrid])
     parity_plot(lin, yr_train, yr_test, "parity_linear.png")
     parity_plot(phys, yr_train, yr_test, "parity_physics.png")
     parity_plot(rf_reg, yr_train, yr_test, "parity_rf.png")
