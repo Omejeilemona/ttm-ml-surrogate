@@ -1,6 +1,6 @@
 """
-ttm_solver.py  (version 1)
-==========================
+ttm_solver.py  (version 1.1: adaptive time steps)
+==================================================
 1D two-temperature model (TTM) for ultrafast laser heating of a metal (gold).
 
     Ce(Te) dTe/dt = d/dz[ ke dTe/dz ] - G (Te - Tl) + S(z, t)     (electrons)
@@ -17,6 +17,10 @@ Version 1 simplifications (to be improved later):
   - no latent heat of melting, no ballistic electron transport
   - no lattice heat conduction (negligible on ps timescales)
   - no heat loss at the surface (insulated boundaries)
+
+Version 1.1 (speed-up): the time step is small (dt) during the laser pulse
+and grows geometrically to dt_max afterwards, when temperatures change
+slowly. Same physics and same discretisation as version 1.
 
 All quantities are in SI units (m, s, K, J, W).
 """
@@ -58,10 +62,36 @@ def pulse_energy_fraction(t_start, t_end, t_peak, tp):
 
 
 # ---------------------------------------------------------------------------
-# 3. The solver
+# 3. Time grid: small steps during the pulse, growing steps afterwards
+# ---------------------------------------------------------------------------
+def make_time_grid(t_end, t_fine_end, dt, dt_max, growth):
+    """
+    Build the list of time points t_0 = 0 < t_1 < ... < t_n = t_end.
+
+    - From 0 to t_fine_end (the end of the pulse) the step is dt.
+    - Afterwards each step is `growth` times longer than the previous one,
+      up to a maximum of dt_max. Growing gradually (e.g. x1.05 per step)
+      rather than jumping avoids a sudden drop in accuracy just after
+      the pulse, when electrons are still cooling quickly.
+    - The final step is shortened so the grid ends exactly at t_end.
+
+    With dt_max = dt this gives the uniform grid of version 1.
+    """
+    times = [0.0]
+    t, h = 0.0, dt
+    while t < t_end * (1.0 - 1e-12):
+        if t >= t_fine_end:
+            h = min(h * growth, dt_max)   # grow the step after the pulse
+        t = min(t + h, t_end)             # never step past t_end
+        times.append(t)
+    return np.array(times)
+
+
+# ---------------------------------------------------------------------------
+# 4. The solver
 # ---------------------------------------------------------------------------
 def run_ttm(F_abs, tp, params=GOLD, L=1.0e-6, dz=1.0e-9, dt=2.0e-15,
-            t_end=20e-12, T0=300.0, n_iter=2):
+            dt_max=50e-15, growth=1.05, t_end=20e-12, T0=300.0, n_iter=2):
     """
     Solve the 1D TTM for one laser pulse.
 
@@ -71,7 +101,10 @@ def run_ttm(F_abs, tp, params=GOLD, L=1.0e-6, dz=1.0e-9, dt=2.0e-15,
     tp    : pulse duration (FWHM), s
     L     : sample thickness, m   (must be much larger than the heated depth)
     dz    : grid spacing, m
-    dt    : time step, s
+    dt    : time step during the pulse, s
+    dt_max: largest time step allowed after the pulse, s (dt_max = dt
+            reproduces the constant-step solver of version 1)
+    growth: factor by which the step grows each step after the pulse
     t_end : simulated time, s
     T0    : initial temperature, K
     n_iter: iterations per time step for the heat-capacity update (2 is enough)
@@ -96,7 +129,11 @@ def run_ttm(F_abs, tp, params=GOLD, L=1.0e-6, dz=1.0e-9, dt=2.0e-15,
 
     # Pulse peak placed 3 FWHM after t = 0 so the pulse starts from ~zero
     t_peak = 3.0 * tp
-    n_steps = int(round(t_end / dt))
+
+    # Time grid. The pulse is over (all but ~1e-12 of its energy delivered)
+    # at t_peak + 3 FWHM; only after that do the steps start to grow.
+    times = make_time_grid(t_end, t_peak + 3.0 * tp, dt, dt_max, growth)
+    n_steps = len(times) - 1
 
     # Storage for surface temperatures (every step) and the maximum lattice
     # temperature reached at each depth (used for the melt-depth estimate)
@@ -112,15 +149,17 @@ def run_ttm(F_abs, tp, params=GOLD, L=1.0e-6, dz=1.0e-9, dt=2.0e-15,
 
     E0 = total_energy(Te, Tl)
 
-    # Implicit electron-lattice coupling (see explanation in the guide):
-    # eliminating Tl_new gives an effective coupling G_eff = G / (1 + a)
-    a = dt * G / Cl
-    G_eff = G / (1.0 + a)
-
     ab = np.zeros((3, N))   # banded matrix storage for solve_banded
 
     for n in range(n_steps):
-        t_old, t_new = n * dt, (n + 1) * dt
+        t_old, t_new = times[n], times[n + 1]
+        dt = t_new - t_old          # length of THIS step (no longer constant)
+
+        # Implicit electron-lattice coupling (see explanation in the guide):
+        # eliminating Tl_new gives an effective coupling G_eff = G / (1 + a).
+        # Both depend on dt, so they are recomputed every step.
+        a = dt * G / Cl
+        G_eff = G / (1.0 + a)
 
         # Conductivity evaluated at the old temperatures ("lagged")
         ke = k0 * Te / Tl
@@ -174,7 +213,7 @@ def run_ttm(F_abs, tp, params=GOLD, L=1.0e-6, dz=1.0e-9, dt=2.0e-15,
 
 
 # ---------------------------------------------------------------------------
-# 4. Example run: executed only when this file is run directly
+# 5. Example run: executed only when this file is run directly
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
@@ -206,4 +245,4 @@ if __name__ == "__main__":
     ax.legend()
     fig.tight_layout()
     fig.savefig("ttm_example.png", dpi=150)
-    plt.show()
+    print("Plot saved to ttm_example.png")
