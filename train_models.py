@@ -1,8 +1,8 @@
 """
-train_models.py  (part 1: linear baselines)
-===========================================
-Train simple ML models on the TTM data set (data/data.csv, made by
-generate_data.py) and measure how well they predict unseen inputs.
+train_models.py
+===============
+Train ML models on the TTM data set (data/data.csv, made by generate_data.py)
+and measure how well they predict unseen inputs.
 
 Inputs (features): x1 = log10(F_abs), x2 = log10(tp)
 Targets:
@@ -13,11 +13,20 @@ Workflow
 --------
 1. Split the data once into 80 % training / 20 % test (fixed seed,
    stratified on melted so both parts keep the same ~21 % melted fraction).
-   The test set is used ONLY for the final scores, never for fitting.
-2. Regression baseline: linear regression, Tl_peak ~ w0 + w1 x1 + w2 x2.
-   Scores: MAE (K) and R^2 on training and test sets; parity plot.
-3. Classification baseline: logistic regression on standardised inputs.
-   Scores on the test set: confusion matrix, accuracy, recall (melted).
+   The test set is used ONLY for the final scores, never for fitting or for
+   choosing settings.
+2. Part 1, baselines:
+   - linear regression on Tl_peak;
+   - logistic regression on melted (default C = 1).
+3. Part 2, tuned models. Settings are chosen by 5-fold cross-validation
+   (GridSearchCV) on the TRAINING set only:
+   - random forest regressor on Tl_peak   (max_depth, min_samples_leaf),
+     CV score: mean absolute error;
+   - logistic regression on melted         (C),
+   - random forest classifier on melted    (max_depth, min_samples_leaf),
+     CV score: balanced accuracy = mean of the recalls of both classes.
+4. One comparison table of all models; parity plots; feature importances;
+   predictions for the two samples closest to the melting boundary.
 
 Run with:  conda run -n ttm-ml python train_models.py
 """
@@ -27,8 +36,10 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")                 # write PNG files only, never open windows
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import (train_test_split, GridSearchCV,
+                                     KFold, StratifiedKFold, cross_val_score)
 from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import (mean_absolute_error, r2_score, confusion_matrix,
@@ -42,52 +53,81 @@ from ttm_solver import GOLD
 # ---------------------------------------------------------------------------
 CSV_PATH = "data/data.csv"
 TEST_FRACTION = 0.2       # 20 % of the samples are held back for testing
-SEED = 42                 # fixed seed -> the same split on every run
-PARITY_PLOT = "parity_linear.png"
+SEED = 42                 # fixed seed -> same split, folds and forests every run
+N_FOLDS = 5               # k in k-fold cross-validation
+N_TREES = 300             # trees per forest (more never hurts accuracy, only time)
+FEATURES = ["log10(F_abs)", "log10(tp)"]
+
+# Candidate settings tried by cross-validation
+FOREST_GRID = {"max_depth": [3, 5, 8, 12, None],          # None = grow until leaves are pure
+               "min_samples_leaf": [1, 2, 5, 10, 20]}
+LOGISTIC_GRID = {"logisticregression__C": [0.01, 0.1, 1, 10, 100, 1e3, 1e4, 1e5]}
+
+# Samples on either side of the melting boundary (found in part 1)
+BOUNDARY_CASES = [(1231.0, 1082e-15), (1278.0, 69e-15)]   # (F_abs J/m^2, tp s)
 
 
 # ---------------------------------------------------------------------------
 # 2. Load the data and build the inputs
 # ---------------------------------------------------------------------------
 def load_data(path):
-    """Return X (n x 2: log10 F_abs, log10 tp), y_reg (Tl_peak), y_cls (melted)."""
+    """Return the table, X (n x 2: log10 F_abs, log10 tp), Tl_peak, melted."""
     df = pd.read_csv(path)
     X = np.column_stack([np.log10(df["F_abs"]), np.log10(df["tp"])])
-    return X, df["Tl_peak"].to_numpy(), df["melted"].to_numpy()
+    return df, X, df["Tl_peak"].to_numpy(), df["melted"].to_numpy()
 
 
 # ---------------------------------------------------------------------------
-# 3. Regression baseline: linear regression on Tl_peak
+# 3. Regression models for Tl_peak
 # ---------------------------------------------------------------------------
-def fit_linear_regression(X_train, X_test, y_train, y_test):
+def regression_scores(name, settings, model, cv_mae, X_train, X_test, y_train, y_test):
+    """Collect the numbers for one row of the regression table."""
+    pred_train, pred_test = model.predict(X_train), model.predict(X_test)
+    return {"model": name, "settings": settings, "cv_mae": cv_mae,
+            "train_mae": mean_absolute_error(y_train, pred_train),
+            "test_mae": mean_absolute_error(y_test, pred_test),
+            "train_r2": r2_score(y_train, pred_train),
+            "test_r2": r2_score(y_test, pred_test),
+            "pred_train": pred_train, "pred_test": pred_test}
+
+
+def fit_linear_regression(X_train, X_test, y_train, y_test, cv):
     # Least-squares fit of a plane: Tl_peak = w0 + w1*log10(F) + w2*log10(tp).
-    # No input scaling needed: without a penalty term, scaling the inputs
-    # rescales the weights but leaves the predictions unchanged.
+    # Nothing to tune, but its CV score is computed so it can be compared
+    # with the forest on the same footing.
     model = LinearRegression().fit(X_train, y_train)
-    pred_train = model.predict(X_train)
-    pred_test = model.predict(X_test)
-
-    print("\n=== Linear regression: Tl_peak ===")
-    print(f"Fitted: Tl_peak = {model.intercept_:.1f} "
-          f"{model.coef_[0]:+.1f} * log10(F_abs) {model.coef_[1]:+.1f} * log10(tp)   [K]")
-    scores = {}
-    for name, y, p in [("training", y_train, pred_train), ("test", y_test, pred_test)]:
-        mae = mean_absolute_error(y, p)     # average |prediction - truth|, K
-        r2 = r2_score(y, p)                 # fraction of variance explained
-        scores[name] = (mae, r2)
-        print(f"  {name:8s} set ({len(y):3d} samples): MAE = {mae:6.1f} K,  R^2 = {r2:.4f}")
-    return model, pred_train, pred_test, scores
+    cv_mae = -cross_val_score(LinearRegression(), X_train, y_train, cv=cv,
+                              scoring="neg_mean_absolute_error").mean()
+    print(f"Linear regression: Tl_peak = {model.intercept_:.1f} "
+          f"{model.coef_[0]:+.1f} * log10(F_abs) {model.coef_[1]:+.1f} * log10(tp)  [K]")
+    return regression_scores("Linear regression", "-", model, cv_mae,
+                             X_train, X_test, y_train, y_test)
 
 
-def parity_plot(y_train, pred_train, y_test, pred_test, scores, path):
+def fit_forest_regressor(X_train, X_test, y_train, y_test, cv):
+    # GridSearchCV: for every combination in FOREST_GRID, train on 4 folds of
+    # the training set, score MAE on the 5th, repeat for all 5 folds, average.
+    # The best combination is then refitted on the whole training set.
+    search = GridSearchCV(RandomForestRegressor(n_estimators=N_TREES, random_state=SEED),
+                          FOREST_GRID, cv=cv, scoring="neg_mean_absolute_error",
+                          n_jobs=-1)
+    search.fit(X_train, y_train)
+    p = search.best_params_
+    settings = f"max_depth={p['max_depth']}, min_samples_leaf={p['min_samples_leaf']}"
+    row = regression_scores("Random forest", settings, search.best_estimator_,
+                            -search.best_score_, X_train, X_test, y_train, y_test)
+    row["estimator"] = search.best_estimator_
+    return row
+
+
+def parity_plot(row, y_train, y_test, path):
     """Predicted vs true Tl_peak; perfect predictions lie on the diagonal."""
+    pred_train, pred_test = row["pred_train"], row["pred_test"]
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
     ax.scatter(y_train, pred_train, s=14, alpha=0.5, color="tab:blue",
-               label=f"training (MAE {scores['training'][0]:.0f} K, "
-                     f"$R^2$ {scores['training'][1]:.3f})")
+               label=f"training (MAE {row['train_mae']:.0f} K, $R^2$ {row['train_r2']:.3f})")
     ax.scatter(y_test, pred_test, s=22, color="tab:orange", edgecolor="k", lw=0.4,
-               label=f"test (MAE {scores['test'][0]:.0f} K, "
-                     f"$R^2$ {scores['test'][1]:.3f})")
+               label=f"test (MAE {row['test_mae']:.0f} K, $R^2$ {row['test_r2']:.3f})")
 
     lo = min(y_train.min(), pred_train.min(), y_test.min(), pred_test.min())
     hi = max(y_train.max(), pred_train.max(), y_test.max(), pred_test.max())
@@ -104,75 +144,172 @@ def parity_plot(y_train, pred_train, y_test, pred_test, scores, path):
     ax.set_aspect("equal")
     ax.set_xlabel("True peak $T_l$ from TTM solver (K)")
     ax.set_ylabel("Predicted peak $T_l$ (K)")
-    ax.set_title("Linear regression on log10($F_{abs}$), log10($t_p$)")
+    ax.set_title(f"{row['model']} on log10($F_{{abs}}$), log10($t_p$)")
     ax.legend(loc="upper left", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
-    print(f"  Parity plot saved to {path}")
+    print(f"Parity plot saved to {path}")
 
 
 # ---------------------------------------------------------------------------
-# 4. Classification baseline: logistic regression on melted
+# 4. Classification models for melted
 # ---------------------------------------------------------------------------
-def fit_logistic_regression(X_train, X_test, y_train, y_test):
-    # StandardScaler: shift/scale each input to mean 0, std 1 using the
-    # TRAINING data only (the test set must not influence the model).
-    # This matters because LogisticRegression penalises large weights
-    # (regularisation), which is only fair if the inputs have similar scales.
-    model = make_pipeline(StandardScaler(), LogisticRegression())
-    model.fit(X_train, y_train)
-    pred_test = model.predict(X_test)        # 1 if probability(melted) >= 0.5
+def classification_scores(name, settings, model, cv_bal_acc, X_test, y_test):
+    """Collect the numbers for one row of the classification table."""
+    pred = model.predict(X_test)                 # 1 if probability(melted) >= 0.5
+    tn, fp, fn, tp = confusion_matrix(y_test, pred, labels=[0, 1]).ravel()
+    return {"model": name, "settings": settings, "cv_bal_acc": cv_bal_acc,
+            "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+            "accuracy": accuracy_score(y_test, pred),
+            "recall": recall_score(y_test, pred, pos_label=1),   # TP / (TP + FN)
+            "estimator": model}
 
-    cm = confusion_matrix(y_test, pred_test, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-    accuracy = accuracy_score(y_test, pred_test)
-    recall = recall_score(y_test, pred_test, pos_label=1)   # TP / (TP + FN)
 
-    # What an "always predict not melted" model would score, for comparison
-    trivial_accuracy = np.mean(y_test == 0)
-
-    print("\n=== Logistic regression: melted (test set) ===")
-    print(f"Test set: {len(y_test)} samples, {y_test.sum()} melted "
-          f"({y_test.mean() * 100:.1f} %)")
-    print("Confusion matrix (rows = truth, columns = prediction):")
-    print("                      pred. not melted   pred. melted")
-    print(f"  truly not melted    {tn:16d}   {fp:12d}   (false alarms: {fp})")
-    print(f"  truly melted        {fn:16d}   {tp:12d}   (missed melting: {fn})")
-    print(f"Accuracy           : {accuracy * 100:5.1f} %")
-    print(f"Recall (melted)    : {recall * 100:5.1f} %   ({tp} of {tp + fn} melted cases caught)")
-    print(f"For comparison, always predicting 'not melted' gives "
-          f"{trivial_accuracy * 100:.1f} % accuracy and 0 % recall.")
-
-    # The decision boundary is the line where probability = 0.5. Convert the
-    # fitted weights back to physical inputs and report the threshold
-    # fluence at a few pulse durations.
-    scaler, clf = model.named_steps["standardscaler"], model.named_steps["logisticregression"]
-    w = clf.coef_[0] / scaler.scale_                        # weights on raw log inputs
+def logistic_threshold(model, tp_s):
+    """Fluence (J/m^2) where the logistic model gives probability 0.5."""
+    scaler = model.named_steps["standardscaler"]
+    clf = model.named_steps["logisticregression"]
+    w = clf.coef_[0] / scaler.scale_                 # weights on raw log inputs
     b = clf.intercept_[0] - np.sum(w * scaler.mean_)
-    print("Predicted melting threshold (probability = 0.5):")
-    for tp_s in (50e-15, 100e-15, 1e-12, 2e-12):
-        logF = -(b + w[1] * np.log10(tp_s)) / w[0]
-        print(f"  tp = {tp_s * 1e15:6.0f} fs: F_abs = {10 ** logF:6.0f} J/m^2 "
-              f"({10 ** logF / 10:.0f} mJ/cm^2)")
-    return model
+    return 10.0 ** (-(b + w[1] * np.log10(tp_s)) / w[0])
+
+
+def fit_logistic(X_train, X_test, y_train, y_test, cv):
+    # StandardScaler: shift/scale each input to mean 0, std 1. Inside a
+    # pipeline it is refitted on the training folds only, so neither the CV
+    # validation fold nor the test set influences the scaling.
+    # C is the inverse regularisation strength: small C = strong penalty on
+    # large weights = smoother, more gradual probability curve.
+    pipe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=10000))
+
+    # Part 1 baseline: default C = 1 (CV score computed for comparison only)
+    base = pipe.fit(X_train, y_train)
+    base_cv = cross_val_score(make_pipeline(StandardScaler(), LogisticRegression(max_iter=10000)),
+                              X_train, y_train, cv=cv, scoring="balanced_accuracy").mean()
+    rows = [classification_scores("Logistic regression", "C=1 (default)", base,
+                                  base_cv, X_test, y_test)]
+
+    # Part 2: choose C by cross-validation. When several C values tie for the
+    # best score, GridSearchCV keeps the first one in the list, i.e. the
+    # smallest C (strongest regularisation) that reaches the best score.
+    search = GridSearchCV(make_pipeline(StandardScaler(), LogisticRegression(max_iter=10000)),
+                          LOGISTIC_GRID, cv=cv, scoring="balanced_accuracy", n_jobs=-1)
+    search.fit(X_train, y_train)
+    C = search.best_params_["logisticregression__C"]
+    rows.append(classification_scores("Logistic regression", f"C={C:g} (CV)",
+                                      search.best_estimator_, search.best_score_,
+                                      X_test, y_test))
+    return rows
+
+
+def fit_forest_classifier(X_train, X_test, y_train, y_test, cv):
+    search = GridSearchCV(RandomForestClassifier(n_estimators=N_TREES, random_state=SEED),
+                          FOREST_GRID, cv=cv, scoring="balanced_accuracy", n_jobs=-1)
+    search.fit(X_train, y_train)
+    p = search.best_params_
+    settings = f"max_depth={p['max_depth']}, min_samples_leaf={p['min_samples_leaf']}"
+    return classification_scores("Random forest", settings, search.best_estimator_,
+                                 search.best_score_, X_test, y_test)
 
 
 # ---------------------------------------------------------------------------
-# 5. Main
+# 5. Reporting
+# ---------------------------------------------------------------------------
+def print_regression_table(rows):
+    print("\n=== Tl_peak (regression): MAE in K ===")
+    print(f"| {'Model':19s} | {'Settings (chosen by CV)':36s} | {'CV MAE':>6s} "
+          f"| {'Train MAE':>9s} | {'Test MAE':>8s} | {'Train R^2':>9s} | {'Test R^2':>8s} |")
+    print("|" + "---|" * 7)
+    for r in rows:
+        print(f"| {r['model']:19s} | {r['settings']:36s} | {r['cv_mae']:6.1f} "
+              f"| {r['train_mae']:9.1f} | {r['test_mae']:8.1f} "
+              f"| {r['train_r2']:9.4f} | {r['test_r2']:8.4f} |")
+
+
+def print_classification_table(rows, y_test):
+    print(f"\n=== melted (classification), test set: {len(y_test)} samples, "
+          f"{y_test.sum()} melted ===")
+    print("Confusion matrix as TN / FP / FN / TP "
+          "(FP = false alarm, FN = missed melting)")
+    print(f"| {'Model':19s} | {'Settings':36s} | {'CV bal. acc.':>12s} "
+          f"| {'TN / FP / FN / TP':>17s} | {'Accuracy':>8s} | {'Recall':>6s} |")
+    print("|" + "---|" * 6)
+    for r in rows:
+        cm = f"{r['tn']} / {r['fp']} / {r['fn']} / {r['tp']}"
+        print(f"| {r['model']:19s} | {r['settings']:36s} | {r['cv_bal_acc'] * 100:11.1f} % "
+              f"| {cm:>17s} | {r['accuracy'] * 100:7.1f} % | {r['recall'] * 100:5.1f} % |")
+    print(f"For comparison, always predicting 'not melted' gives "
+          f"{np.mean(y_test == 0) * 100:.1f} % accuracy, 0 % recall, "
+          f"50 % balanced accuracy.")
+
+
+def print_feature_importances(forest, target):
+    # Impurity-based importance: the share of the total error reduction
+    # achieved by each input's split questions, summed over all trees.
+    # It is a SHARE: an input with a real but small effect (tp changes
+    # Tl_peak by ~20 K, F by ~2000 K) gets a tiny value, not zero.
+    print(f"Feature importances, random forest for {target}: "
+          + ", ".join(f"{f} {v:.4f}" for f, v in zip(FEATURES, forest.feature_importances_)))
+
+
+def check_boundary_cases(df, idx_train, idx_test, X, reg_forest, cls_rows):
+    """Report where the near-boundary samples ended up and their predictions."""
+    print("\n=== Samples closest to the melting boundary ===")
+    for F_abs, tp in BOUNDARY_CASES:
+        # Locate the sample in the table (values in the CSV are not rounded)
+        i = int(np.argmin(np.abs(df["F_abs"] - F_abs) / F_abs + np.abs(df["tp"] - tp) / tp))
+        where = "TEST" if i in set(idx_test) else "TRAINING"
+        print(f"F_abs = {df['F_abs'][i]:.1f} J/m^2, tp = {df['tp'][i] * 1e15:.0f} fs: "
+              f"true Tl_peak {df['Tl_peak'][i]:.0f} K, melted {df['melted'][i]} "
+              f"-> in the {where} set")
+        x = X[i:i + 1]
+        preds = [f"RF Tl_peak {reg_forest.predict(x)[0]:.0f} K"]
+        for r in cls_rows:
+            p_melt = r["estimator"].predict_proba(x)[0, 1]
+            preds.append(f"{r['model']} {r['settings']}: P(melted) {p_melt:.2f}")
+        note = ("" if where == "TEST" else
+                "  (training sample: the model has seen it, so this is not a fair test)")
+        print("   " + "; ".join(preds) + note)
+
+
+# ---------------------------------------------------------------------------
+# 6. Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    X, y_reg, y_cls = load_data(CSV_PATH)
+    df, X, y_reg, y_cls = load_data(CSV_PATH)
 
-    # One split for both tasks, stratified on melted.
-    (X_train, X_test, yr_train, yr_test,
-     yc_train, yc_test) = train_test_split(X, y_reg, y_cls,
-                                           test_size=TEST_FRACTION,
-                                           random_state=SEED, stratify=y_cls)
-    print(f"Data: {len(X)} samples -> {len(X_train)} training, {len(X_test)} test")
-    print(f"Melted fraction: training {yc_train.mean() * 100:.1f} %, "
-          f"test {yc_test.mean() * 100:.1f} %")
+    # One split for all models, stratified on melted. Row indices are split
+    # too, so we can tell later which samples ended up in the test set.
+    (X_train, X_test, yr_train, yr_test, yc_train, yc_test,
+     idx_train, idx_test) = train_test_split(X, y_reg, y_cls, np.arange(len(df)),
+                                             test_size=TEST_FRACTION,
+                                             random_state=SEED, stratify=y_cls)
+    print(f"Data: {len(X)} samples -> {len(X_train)} training, {len(X_test)} test; "
+          f"melted fraction {yc_train.mean() * 100:.1f} % / {yc_test.mean() * 100:.1f} %")
 
-    _, p_train, p_test, scores = fit_linear_regression(X_train, X_test, yr_train, yr_test)
-    parity_plot(yr_train, p_train, yr_test, p_test, scores, PARITY_PLOT)
+    # Cross-validation folds (within the training set only). Stratified folds
+    # for classification keep ~21 % melted in every fold.
+    cv_reg = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    cv_cls = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
-    fit_logistic_regression(X_train, X_test, yc_train, yc_test)
+    # --- Regression: Tl_peak ---
+    lin = fit_linear_regression(X_train, X_test, yr_train, yr_test, cv_reg)
+    rf_reg = fit_forest_regressor(X_train, X_test, yr_train, yr_test, cv_reg)
+    print_regression_table([lin, rf_reg])
+    parity_plot(lin, yr_train, yr_test, "parity_linear.png")
+    parity_plot(rf_reg, yr_train, yr_test, "parity_rf.png")
+    print_feature_importances(rf_reg["estimator"], "Tl_peak")
+
+    # --- Classification: melted ---
+    cls_rows = fit_logistic(X_train, X_test, yc_train, yc_test, cv_cls)
+    cls_rows.append(fit_forest_classifier(X_train, X_test, yc_train, yc_test, cv_cls))
+    print_classification_table(cls_rows, yc_test)
+    print_feature_importances(cls_rows[-1]["estimator"], "melted")
+
+    print("\nLogistic-regression melting threshold (P = 0.5), J/m^2:")
+    for r in cls_rows[:2]:
+        print(f"  {r['settings']:15s}: " + ", ".join(
+            f"{tp * 1e15:.0f} fs -> {logistic_threshold(r['estimator'], tp):.0f}"
+            for tp in (50e-15, 100e-15, 1e-12, 2e-12)))
+
+    check_boundary_cases(df, idx_train, idx_test, X, rf_reg["estimator"], cls_rows)
