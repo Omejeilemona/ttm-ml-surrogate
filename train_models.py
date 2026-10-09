@@ -25,8 +25,16 @@ Workflow
    - logistic regression on melted         (C),
    - random forest classifier on melted    (max_depth, min_samples_leaf),
      CV score: balanced accuracy = mean of the recalls of both classes.
-4. One comparison table of all models; parity plots; feature importances;
-   predictions for the two samples closest to the melting boundary.
+4. Part 3:
+   - physics-informed model: linear regression on log10(Tl_peak - 300 K),
+     i.e. a power law Tl_peak - 300 K = A * F_abs^a * tp^b; predictions
+     are converted back with Tl = 300 + 10**z, so always above 300 K;
+   - extrapolation test: train linear, physics-informed and random forest
+     on F_abs < 1500 J/m^2 only, test on F_abs >= 1500 J/m^2.
+5. One comparison table of all models; parity plots (parity_linear.png,
+   parity_physics.png, parity_rf.png); extrapolation.png; feature
+   importances; predictions for the two samples closest to the melting
+   boundary.
 
 Run with:  conda run -n ttm-ml python train_models.py
 """
@@ -40,6 +48,7 @@ from sklearn.model_selection import (train_test_split, GridSearchCV,
                                      KFold, StratifiedKFold, cross_val_score)
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import (mean_absolute_error, r2_score, confusion_matrix,
@@ -65,6 +74,9 @@ LOGISTIC_GRID = {"logisticregression__C": [0.01, 0.1, 1, 10, 100, 1e3, 1e4, 1e5]
 
 # Samples on either side of the melting boundary (found in part 1)
 BOUNDARY_CASES = [(1231.0, 1082e-15), (1278.0, 69e-15)]   # (F_abs J/m^2, tp s)
+
+T0 = 300.0                # initial temperature of every solver run, K
+F_SPLIT = 1500.0          # extrapolation test: train below, test at/above (J/m^2)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +129,41 @@ def fit_forest_regressor(X_train, X_test, y_train, y_test, cv):
     row = regression_scores("Random forest", settings, search.best_estimator_,
                             -search.best_score_, X_train, X_test, y_train, y_test)
     row["estimator"] = search.best_estimator_
+    return row
+
+
+def to_log_rise(T):
+    """Tl_peak (K) -> log10 of the temperature rise above T0."""
+    return np.log10(T - T0)
+
+
+def from_log_rise(z):
+    """log10(temperature rise) -> Tl_peak (K). Always > T0, since 10**z > 0."""
+    return T0 + 10.0 ** z
+
+
+def make_physics_model():
+    # Power law  Tl_peak - T0 = A * F_abs^a * tp^b  becomes linear after
+    # taking log10:  log10(Tl_peak - T0) = log10(A) + a*log10(F) + b*log10(tp).
+    # TransformedTargetRegressor applies to_log_rise before fitting and
+    # from_log_rise after predicting, so predictions and scores are in K.
+    return TransformedTargetRegressor(regressor=LinearRegression(),
+                                      func=to_log_rise, inverse_func=from_log_rise)
+
+
+def fit_physics_regression(X_train, X_test, y_train, y_test, cv):
+    model = make_physics_model().fit(X_train, y_train)
+    cv_mae = -cross_val_score(make_physics_model(), X_train, y_train, cv=cv,
+                              scoring="neg_mean_absolute_error").mean()
+    a, b = model.regressor_.coef_            # exponents of F_abs and tp
+    # Prefactor quoted at reference values F = 1000 J/m^2, tp = 1 ps, so the
+    # number is readable (with tp in seconds it would be ~10^-12 scaled)
+    dT_ref = 10.0 ** (model.regressor_.intercept_ + a * 3.0 + b * (-12.0))
+    print(f"Physics-informed: Tl_peak - {T0:.0f} K = {dT_ref:.0f} K "
+          f"* (F_abs / 1000 J/m^2)^{a:.3f} * (tp / 1 ps)^{b:.3f}")
+    row = regression_scores("Physics-informed", f"power law: F^{a:.3f}, tp^{b:.3f}",
+                            model, cv_mae, X_train, X_test, y_train, y_test)
+    row["exponents"] = (a, b)
     return row
 
 
@@ -273,7 +320,73 @@ def check_boundary_cases(df, idx_train, idx_test, X, reg_forest, cls_rows):
 
 
 # ---------------------------------------------------------------------------
-# 6. Main
+# 6. Extrapolation test: train at low fluence, predict at high fluence
+# ---------------------------------------------------------------------------
+def extrapolation_test(df, X, y, path):
+    """
+    Train on all runs with F_abs < F_SPLIT and test on all runs with
+    F_abs >= F_SPLIT. This is separate from the 80/20 split: here the test
+    inputs lie OUTSIDE the training range, which a random split never does.
+
+    A random forest predicts averages of training targets, so it can never
+    predict a Tl_peak above the largest one it was trained on. The linear
+    and physics-informed models are formulas and continue beyond the data.
+    """
+    F = df["F_abs"].to_numpy()
+    low, high = F < F_SPLIT, F >= F_SPLIT
+    X_low, y_low, X_high, y_high = X[low], y[low], X[high], y[high]
+
+    # Forest settings re-chosen by CV on the low-fluence runs only, so no
+    # high-fluence information reaches any model
+    cv = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    search = GridSearchCV(RandomForestRegressor(n_estimators=N_TREES, random_state=SEED),
+                          FOREST_GRID, cv=cv, scoring="neg_mean_absolute_error", n_jobs=-1)
+    search.fit(X_low, y_low)
+    p = search.best_params_
+    models = [("Linear regression", LinearRegression().fit(X_low, y_low)),
+              ("Physics-informed", make_physics_model().fit(X_low, y_low)),
+              (f"Random forest (max_depth={p['max_depth']}, "
+               f"min_samples_leaf={p['min_samples_leaf']})", search.best_estimator_)]
+
+    print(f"\n=== Extrapolation test: train on F_abs < {F_SPLIT:.0f} J/m^2 "
+          f"({low.sum()} runs, Tl_peak up to {y_low.max():.0f} K), "
+          f"test on F_abs >= {F_SPLIT:.0f} ({high.sum()} runs, "
+          f"Tl_peak {y_high.min():.0f}-{y_high.max():.0f} K) ===")
+    print(f"| {'Model':52s} | {'MAE, training range':>19s} | "
+          f"{'MAE, extrapolation':>18s} | {'Max predicted Tl':>16s} |")
+    print("|" + "---|" * 4)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.6), sharey=True)
+    for ax, (name, model) in zip(axes, models):
+        pred_low, pred_high = model.predict(X_low), model.predict(X_high)
+        mae_low = mean_absolute_error(y_low, pred_low)
+        mae_high = mean_absolute_error(y_high, pred_high)
+        print(f"| {name:52s} | {mae_low:17.1f} K | {mae_high:16.1f} K | "
+              f"{pred_high.max():14.0f} K |")
+
+        ax.axvspan(F_SPLIT, F.max() * 1.05, color="tab:red", alpha=0.07, lw=0)
+        ax.axvline(F_SPLIT, color="tab:red", ls="--", lw=1)
+        ax.axhline(GOLD["Tm"], color="gray", ls=":", lw=1)
+        ax.scatter(F, y, s=10, color="0.65", label="TTM solver (true)")
+        ax.scatter(F[low], pred_low, s=8, color="tab:blue",
+                   label="prediction, training range")
+        ax.scatter(F[high], pred_high, s=14, color="tab:red", edgecolor="k", lw=0.3,
+                   label="prediction, extrapolation")
+        ax.set_xscale("log")
+        ax.set_xlabel("Absorbed fluence $F_{abs}$ (J/m$^2$)")
+        ax.set_title(f"{name.split(' (')[0]}\nextrapolation MAE {mae_high:.0f} K", fontsize=10)
+    axes[0].set_ylabel("Peak surface $T_l$ (K)")
+    axes[0].legend(loc="upper left", fontsize=8)
+    axes[1].text(F_SPLIT * 1.05, y.min(), "test only", color="tab:red", fontsize=8)
+    fig.suptitle(f"Extrapolation: trained on $F_{{abs}}$ < {F_SPLIT:.0f} J/m$^2$ only",
+                 fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    print(f"Extrapolation plot saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# 7. Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     df, X, y_reg, y_cls = load_data(CSV_PATH)
@@ -294,11 +407,14 @@ if __name__ == "__main__":
 
     # --- Regression: Tl_peak ---
     lin = fit_linear_regression(X_train, X_test, yr_train, yr_test, cv_reg)
+    phys = fit_physics_regression(X_train, X_test, yr_train, yr_test, cv_reg)
     rf_reg = fit_forest_regressor(X_train, X_test, yr_train, yr_test, cv_reg)
-    print_regression_table([lin, rf_reg])
+    print_regression_table([lin, phys, rf_reg])
     parity_plot(lin, yr_train, yr_test, "parity_linear.png")
+    parity_plot(phys, yr_train, yr_test, "parity_physics.png")
     parity_plot(rf_reg, yr_train, yr_test, "parity_rf.png")
     print_feature_importances(rf_reg["estimator"], "Tl_peak")
+    extrapolation_test(df, X, y_reg, "extrapolation.png")
 
     # --- Classification: melted ---
     cls_rows = fit_logistic(X_train, X_test, yc_train, yc_test, cv_cls)
